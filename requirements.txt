@@ -1,0 +1,42 @@
+# Core PyTorch
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+
+# nnU-Net v2
+nnunetv2>=2.2.0
+batchgenerators>=0.25.0
+
+# PyTorch Radiomics - install from GitHub
+# Note: torchradiomics is not on PyPI, install manually after installing other packages:
+# pip install git+https://github.com/AIM-Harvard/pytorch-radiomics.git
+# Or if the above doesn't work, try:
+# pip install git+https://github.com/AIM-Harvard/pytorch-radiomics.git@main
+
+# Medical Imaging
+SimpleITK>=2.2.0
+nibabel>=3.2.0
+
+# Data Science & ML
+numpy>=1.21.0
+pandas>=1.3.0
+scikit-learn>=1.0.0
+scipy>=1.7.0
+
+# Data I/O
+openpyxl>=3.0.0  # For reading Excel files (subInfo_train.xlsx, subInfo_test.xlsx)
+pyarrow>=5.0.0  # For parquet file support
+
+# Utilities
+tqdm>=4.62.0
+joblib>=1.0.0
+
+# Optional but recommended
+tensorboard>=2.8.0
+matplotlib>=3.5.0
+seaborn>=0.11.0
+
+# Jupyter (optional, for notebooks)
+jupyter>=1.0.0
+ipython>=7.0.0
+
