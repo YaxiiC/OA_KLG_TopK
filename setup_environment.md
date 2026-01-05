@@ -7,7 +7,8 @@ This guide helps you set up the Python environment for running the radiomics ext
 - **CUDA**: nnU-Net and PyTorch Radiomics require CUDA for GPU acceleration
   - Check your CUDA version: `nvidia-smi` or `nvcc --version`
   - Recommended: CUDA 11.8 or 12.1
-- **Python**: 3.8 - 3.10 (3.10 recommended)
+- **Python**: 3.7 (required for pyradiomics compatibility)
+  - Note: Some newer package versions may not support Python 3.7, so version constraints are set accordingly
 
 ## Option 1: Using Conda (Recommended)
 
@@ -187,11 +188,28 @@ If you run out of memory during training:
 Run a quick test to verify everything works:
 
 ```python
+import sys
+print(f"Python version: {sys.version}")
+
 import torch
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
-from torchradiomics import TorchRadiomicsFirstOrder
+
+# Test torchradiomics (if using PyTorch-based)
+try:
+    from torchradiomics import TorchRadiomicsFirstOrder
+    print("torchradiomics imported successfully")
+except ImportError:
+    print("torchradiomics not available (optional)")
+
+# Test pyradiomics (if using original PyRadiomics)
+try:
+    import radiomics
+    print("pyradiomics imported successfully")
+except ImportError:
+    print("pyradiomics not available (optional)")
+
 import SimpleITK as sitk
 from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 
@@ -201,8 +219,18 @@ if torch.cuda.is_available():
     print(f"CUDA version: {torch.version.cuda}")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-print("All imports successful!")
+print("All core packages imported successfully!")
 ```
+
+## Python 3.7 Compatibility Notes
+
+Since Python 3.7 is required for pyradiomics, some package versions have been constrained:
+- **numpy**: <1.24.0 (numpy 1.24+ requires Python 3.8+)
+- **pandas**: <2.0.0 (pandas 2.0+ requires Python 3.8+)
+- **scikit-learn**: <1.2.0 (scikit-learn 1.2+ requires Python 3.8+)
+- **scipy**: <1.10.0 (scipy 1.10+ requires Python 3.8+)
+
+If you encounter compatibility issues, you may need to adjust these version constraints.
 
 ## Environment Variables (Optional)
 
