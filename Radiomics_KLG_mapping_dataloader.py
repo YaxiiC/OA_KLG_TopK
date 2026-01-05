@@ -363,12 +363,23 @@ class RadiomicsKLGDataLoader:
     
     def load_radiomics(self, features_path: Union[str, Path]):
         """
-        Load pre-extracted radiomics features.
+        Load pre-extracted radiomics features from CSV/Parquet.
+        This is the primary method for loading radiomics in the training environment.
+        
+        Note: To extract radiomics from predicted masks (e.g., from nnunet_segmentation_inference.py),
+        use torchradiomics_from_ROIs.py with --mode extract_from_masks and --predicted-masks-dir
+        pointing to the output directory (which contains train/ and test/ subdirectories with
+        {case_id}_majority_vote.nii.gz files).
         
         Args:
             features_path: Path to saved radiomics features (CSV/Parquet)
+                          Expected format: columns=['case_id', 'roi_name', 'feature_name', 'value']
+                          or wide format with one row per case+ROI
         """
         features_path = Path(features_path)
+        
+        if not features_path.exists():
+            raise FileNotFoundError(f"Radiomics features file not found: {features_path}")
         
         if features_path.suffix == '.parquet':
             self.features_df = pd.read_parquet(features_path)
@@ -376,7 +387,25 @@ class RadiomicsKLGDataLoader:
             self.features_df = pd.read_csv(features_path)
         
         logger.info(f"Loaded radiomics features from {features_path}")
-        logger.info(f"Total cases: {len(self.features_df['case_id'].unique())}")
+        logger.info(f"Shape: {self.features_df.shape}")
+        logger.info(f"Columns: {self.features_df.columns.tolist()}")
+        
+        # Check if data is in long format (case_id, roi_name, feature_name, value)
+        # or wide format (case_id, roi_name, feature1, feature2, ...)
+        if 'feature_name' in self.features_df.columns and 'value' in self.features_df.columns:
+            # Long format - will be converted to wide in get_training_data()
+            logger.info("Detected long format (case_id, roi_name, feature_name, value)")
+            logger.info(f"Total cases: {self.features_df['case_id'].nunique()}")
+            logger.info(f"Total ROIs: {self.features_df.groupby(['case_id', 'roi_name']).ngroups}")
+            logger.info(f"Total features: {self.features_df['feature_name'].nunique()}")
+        else:
+            # Wide format - already pivoted
+            logger.info("Detected wide format (one row per case+ROI)")
+            if 'case_id' in self.features_df.columns:
+                logger.info(f"Total cases: {self.features_df['case_id'].nunique()}")
+            if 'roi_name' in self.features_df.columns:
+                logger.info(f"Total ROIs: {self.features_df['roi_name'].nunique()}")
+            logger.info(f"Total feature columns: {len([c for c in self.features_df.columns if c not in ['case_id', 'roi_name']])}")
     
     def get_training_data(self, target_column: str = None) -> pd.DataFrame:
         """
@@ -389,14 +418,26 @@ class RadiomicsKLGDataLoader:
             DataFrame with all features and metadata
         """
         if self.features_df is None:
-            raise ValueError("Radiomics features not extracted. Call extract_all_radiomics() or load_radiomics() first.")
+            raise ValueError("Radiomics features not loaded. Call load_radiomics() first.")
         
-        # Convert to wide format (one row per case+ROI)
-        df_wide = self.features_df.pivot_table(
-            index=['case_id', 'roi_name'],
-            columns='feature_name',
-            values='value'
-        ).reset_index()
+        # Check if data is already in wide format or needs pivoting
+        if 'feature_name' in self.features_df.columns and 'value' in self.features_df.columns:
+            # Long format - convert to wide format (one row per case+ROI)
+            df_wide = self.features_df.pivot_table(
+                index=['case_id', 'roi_name'],
+                columns='feature_name',
+                values='value'
+            ).reset_index()
+        else:
+            # Already in wide format
+            df_wide = self.features_df.copy()
+            # Ensure case_id and roi_name are present
+            if 'case_id' not in df_wide.columns:
+                raise ValueError("case_id column not found in radiomics data")
+            if 'roi_name' not in df_wide.columns:
+                # If no roi_name, assume all data is for a single ROI or add default
+                logger.warning("roi_name column not found, assuming single ROI")
+                df_wide['roi_name'] = 'unknown'
         
         # Add knee side information
         df_wide['knee_side'] = df_wide['case_id'].apply(

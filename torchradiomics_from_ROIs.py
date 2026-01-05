@@ -362,6 +362,100 @@ def extract_rois(
 # Main Workflow
 # ============================================================================
 
+def process_case_from_predicted_mask(
+    case_image_path: Union[str, Path],
+    predicted_mask_path: Union[str, Path],
+    roi_labels: Dict[int, str] = None,
+    radiomics_groups: List[str] = None,
+    device: torch.device = None,
+    voxelArrayShift: int = 0,
+    binWidth: Optional[float] = None
+) -> pd.DataFrame:
+    """
+    Extract radiomics from a case using a pre-saved predicted mask.
+    This function is for use in a separate environment (radiomics extraction only).
+    
+    Args:
+        case_image_path: Path to input image (NIfTI)
+        predicted_mask_path: Path to predicted segmentation mask (NIfTI)
+        roi_labels: Dict mapping label value -> ROI name
+        radiomics_groups: List of radiomics feature groups to extract
+        device: PyTorch device
+        voxelArrayShift: Voxel array shift to apply
+        binWidth: Histogram bin width
+    
+    Returns:
+        DataFrame with columns: case_id, roi_name, feature_name, value
+    """
+    case_image_path = Path(case_image_path)
+    predicted_mask_path = Path(predicted_mask_path)
+    
+    case_id = case_image_path.stem.replace('.nii', '').replace('.gz', '').replace('_0000', '')
+    logger.info(f"Processing case: {case_id}")
+    
+    # Load predicted mask
+    sitk_mask = sitk.ReadImage(str(predicted_mask_path))
+    segmentation = sitk.GetArrayFromImage(sitk_mask)
+    
+    # Extract ROIs
+    rois = extract_rois(segmentation, roi_labels=roi_labels)
+    
+    if len(rois) == 0:
+        logger.warning(f"No valid ROIs found for case {case_id}")
+        return pd.DataFrame(columns=['case_id', 'roi_name', 'feature_name', 'value'])
+    
+    # Load original image for radiomics
+    sitk_image = sitk.ReadImage(str(case_image_path))
+    image_array = sitk.GetArrayFromImage(sitk_image)
+    image_tensor = torch.from_numpy(image_array).float()
+    
+    # Get spacing (SITK order is x,y,z, but we need z,y,x)
+    spacing_xyz = sitk_image.GetSpacing()
+    spacing_zyx = [spacing_xyz[2], spacing_xyz[1], spacing_xyz[0]]
+    
+    # Extract radiomics for each ROI
+    results = []
+    
+    for roi_name, roi_mask in rois.items():
+        logger.info(f"  Extracting radiomics for {roi_name}...")
+        
+        roi_mask_tensor = torch.from_numpy(roi_mask).float()
+        
+        try:
+            features_dict, feature_names = extract_radiomics_with_groups(
+                image_tensor,
+                roi_mask_tensor,
+                voxelArrayShift=voxelArrayShift,
+                pixelSpacing=spacing_zyx,
+                binWidth=binWidth,
+                groups=radiomics_groups,
+                device=device
+            )
+            
+            # Convert to DataFrame rows
+            for feat_name, feat_value in features_dict.items():
+                if isinstance(feat_value, torch.Tensor):
+                    feat_value = feat_value.item()
+                
+                # Check for invalid values
+                if math.isnan(feat_value) or math.isinf(feat_value):
+                    logger.warning(f"  Invalid feature {feat_name} for {roi_name}: {feat_value}")
+                    continue
+                
+                results.append({
+                    'case_id': case_id,
+                    'roi_name': roi_name,
+                    'feature_name': feat_name,
+                    'value': feat_value
+                })
+        
+        except Exception as e:
+            logger.error(f"  Failed to extract radiomics for {roi_name}: {e}")
+            continue
+    
+    return pd.DataFrame(results)
+
+
 def process_case(
     case_image_path: Union[str, Path],
     model_dir: Union[str, Path],
@@ -543,6 +637,30 @@ def main():
         help='Output format for results'
     )
     
+    # New arguments for extracting from pre-saved predicted masks
+    parser.add_argument(
+        '--predicted-masks-dir',
+        type=str,
+        default=None,
+        help='Directory containing pre-saved predicted masks (NIfTI format). If provided, extracts radiomics from these masks instead of running nnU-Net inference. Can be root directory with train/test subdirs (from nnunet_segmentation_inference.py) or flat directory.'
+    )
+    
+    parser.add_argument(
+        '--mode',
+        type=str,
+        default='inference',
+        choices=['inference', 'extract_from_masks'],
+        help='Mode: inference (run nnU-Net) or extract_from_masks (extract from pre-saved masks)'
+    )
+    
+    parser.add_argument(
+        '--split',
+        type=str,
+        choices=['train', 'test', 'both'],
+        default='both',
+        help='Which split to process when extracting from predicted masks (train, test, or both). Only used if masks are in train/test subdirectories.'
+    )
+    
     args = parser.parse_args()
     
     # Setup device
@@ -580,31 +698,118 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    for idx, image_path in enumerate(image_files, 1):
-        logger.info(f"\n[{idx}/{len(image_files)}] Processing {image_path.name}")
+    # Mode: extract from pre-saved predicted masks
+    if args.mode == 'extract_from_masks' or args.predicted_masks_dir:
+        if not args.predicted_masks_dir:
+            raise ValueError("--predicted-masks-dir is required when using extract_from_masks mode")
         
-        try:
-            case_results = process_case(
-                image_path,
-                args.nnunet_model_dir,
-                output_dir,
-                folds=args.folds,
-                radiomics_groups=args.radiomics_groups,
-                device=device,
-                save_masks=args.save_masks,
-                roi_labels=roi_labels,
-                voxelArrayShift=args.voxel_array_shift,
-                binWidth=args.bin_width
-            )
-            
-            if len(case_results) > 0:
-                all_results.append(case_results)
+        predicted_masks_dir = Path(args.predicted_masks_dir)
+        logger.info(f"Extracting radiomics from pre-saved predicted masks in {predicted_masks_dir}")
+        
+        # Check if masks are organized in train/test subdirectories (from nnunet_segmentation_inference.py)
+        train_dir = predicted_masks_dir / 'train'
+        test_dir = predicted_masks_dir / 'test'
+        has_subdirs = train_dir.exists() or test_dir.exists()
+        
+        # Determine which splits to search
+        splits_to_search = []
+        if has_subdirs:
+            if args.split == 'both':
+                splits_to_search = ['train', 'test']
             else:
-                logger.warning(f"No results for {image_path.name}")
+                splits_to_search = [args.split]
+        else:
+            splits_to_search = [None]  # Search in root directory
         
-        except Exception as e:
-            logger.error(f"Error processing {image_path.name}: {e}", exc_info=True)
-            continue
+        for idx, image_path in enumerate(image_files, 1):
+            logger.info(f"\n[{idx}/{len(image_files)}] Processing {image_path.name}")
+            
+            # Extract case ID from image filename
+            case_id = image_path.stem.replace('.nii', '').replace('.gz', '').replace('_0000', '')
+            
+            # Find corresponding predicted mask
+            mask_path = None
+            
+            if has_subdirs:
+                # Search in train/test subdirectories
+                for split_name in splits_to_search:
+                    if split_name == 'train':
+                        mask_path = train_dir / f"{case_id}_majority_vote.nii.gz"
+                    elif split_name == 'test':
+                        mask_path = test_dir / f"{case_id}_majority_vote.nii.gz"
+                    
+                    if mask_path.exists():
+                        break
+            else:
+                # Old format: try multiple naming conventions in root directory
+                mask_name = image_path.name
+                mask_path = predicted_masks_dir / mask_name
+                
+                if not mask_path.exists():
+                    # Try without _0000 suffix
+                    mask_name_alt = mask_name.replace('_0000.nii.gz', '.nii.gz').replace('_0000.nii', '.nii')
+                    mask_path = predicted_masks_dir / mask_name_alt
+                
+                if not mask_path.exists():
+                    # Try with _pred_mask suffix
+                    mask_name_alt2 = image_path.stem.replace('.nii', '').replace('.gz', '') + '_pred_mask.nii.gz'
+                    mask_path = predicted_masks_dir / mask_name_alt2
+                
+                if not mask_path.exists():
+                    # Try with _majority_vote suffix (new format)
+                    mask_path = predicted_masks_dir / f"{case_id}_majority_vote.nii.gz"
+            
+            if not mask_path or not mask_path.exists():
+                logger.warning(f"Predicted mask not found for {image_path.name} (case_id: {case_id}), skipping")
+                continue
+            
+            try:
+                case_results = process_case_from_predicted_mask(
+                    image_path,
+                    mask_path,
+                    roi_labels=roi_labels,
+                    radiomics_groups=args.radiomics_groups,
+                    device=device,
+                    voxelArrayShift=args.voxel_array_shift,
+                    binWidth=args.bin_width
+                )
+                
+                if len(case_results) > 0:
+                    all_results.append(case_results)
+                else:
+                    logger.warning(f"No results for {image_path.name}")
+            
+            except Exception as e:
+                logger.error(f"Error processing {image_path.name}: {e}", exc_info=True)
+                continue
+    
+    # Mode: inference (run nnU-Net)
+    else:
+        for idx, image_path in enumerate(image_files, 1):
+            logger.info(f"\n[{idx}/{len(image_files)}] Processing {image_path.name}")
+            
+            try:
+                case_results = process_case(
+                    image_path,
+                    args.nnunet_model_dir,
+                    output_dir,
+                    folds=args.folds,
+                    radiomics_groups=args.radiomics_groups,
+                    device=device,
+                    save_masks=args.save_masks,
+                    roi_labels=roi_labels,
+                    voxelArrayShift=args.voxel_array_shift,
+                    binWidth=args.bin_width
+                )
+                
+                if len(case_results) > 0:
+                    all_results.append(case_results)
+                else:
+                    logger.warning(f"No results for {image_path.name}")
+            
+            except Exception as e:
+                logger.error(f"Error processing {image_path.name}: {e}", exc_info=True)
+                continue
     
     # Combine and save results
     if len(all_results) == 0:

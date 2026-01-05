@@ -283,7 +283,8 @@ def prepare_Xy(
             raise ValueError("'case_id' column not found for all_rois mode")
         
         # Pivot wide: one row per case, ROI features as columns
-        logger.info("Merging ROIs into one row per case...")
+        # This creates a whole-image feature representation (all ROIs combined)
+        logger.info("Merging ROIs into one row per case (whole image features)...")
         df_wide_list = []
         for case_id in df['case_id'].unique():
             case_df = df[df['case_id'] == case_id].copy()
@@ -292,14 +293,16 @@ def prepare_Xy(
             for _, row in case_df.iterrows():
                 roi_name_row = row['roi_name']
                 for col in case_df.columns:
-                    if col not in ['case_id', 'roi_name']:
-                        new_col = f"roi{roi_name_row}__{col}"
+                    if col not in ['case_id', 'roi_name', target_col]:
+                        # Prefix feature name with ROI name to avoid conflicts
+                        new_col = f"roi_{roi_name_row}__{col}"
                         case_row[new_col] = row[col]
             
             df_wide_list.append(case_row)
         
         df = pd.DataFrame(df_wide_list)
-        logger.info(f"Merged to {len(df)} rows (one per case)")
+        logger.info(f"Merged to {len(df)} rows (one per case, whole image features)")
+        logger.info(f"Total features after merging: {len([c for c in df.columns if c != 'case_id' and c != target_col])}")
     
     # Extract target
     y = df[target_col].copy()
@@ -1206,7 +1209,10 @@ def train_roi_model(
     
     # Create a simple wrapper class for the full pipeline
     class FullPipeline:
-        """Wrapper for the complete preprocessing + classification pipeline."""
+        """
+        Wrapper for the complete preprocessing + classification pipeline.
+        Takes whole image features (all ROIs combined) as input and outputs class probabilities.
+        """
         def __init__(self, variance_threshold, variance_selector, preprocessor, 
                      feature_subset, classifier, corr_threshold=None):
             self.variance_threshold = variance_threshold
@@ -1216,8 +1222,15 @@ def train_roi_model(
             self.classifier = classifier
             self.corr_threshold = corr_threshold
         
-        def predict(self, X):
-            """Predict labels."""
+        def _process_input(self, X):
+            """
+            Process input features through the full pipeline.
+            Returns processed features ready for prediction.
+            """
+            # Ensure X is a DataFrame
+            if not isinstance(X, pd.DataFrame):
+                raise ValueError("Input X must be a pandas DataFrame")
+            
             # Apply variance threshold using pre-fitted selector
             if self.variance_selector is not None:
                 X_transformed = self.variance_selector.transform(X)
@@ -1225,10 +1238,10 @@ def train_roi_model(
                 feature_names = X.columns[feature_mask].tolist()
                 X = pd.DataFrame(X_transformed, columns=feature_names, index=X.index)
             
-            # Select features
+            # Select features from the best subset
             available = [f for f in self.feature_subset if f in X.columns]
             if len(available) == 0:
-                raise ValueError("No features from subset available in X")
+                raise ValueError(f"No features from subset available in X. Available columns: {X.columns.tolist()[:10]}...")
             X = X[available]
             
             # Apply correlation filtering if needed
@@ -1236,41 +1249,48 @@ def train_roi_model(
                 features_to_keep = filter_correlated_features(
                     X, threshold=self.corr_threshold
                 )
+                if len(features_to_keep) == 0:
+                    raise ValueError("No features remaining after correlation filtering")
                 X = X[features_to_keep]
             
-            # Apply preprocessing
+            # Apply preprocessing (imputation + scaling)
             X_processed = self.preprocessor.transform(X)
             
-            # Predict
+            return X_processed
+        
+        def predict(self, X):
+            """
+            Predict class labels for whole image features.
+            
+            Args:
+                X: DataFrame with features (all ROIs combined, one row per case)
+            
+            Returns:
+                Array of predicted class labels
+            """
+            X_processed = self._process_input(X)
             return self.classifier.predict(X_processed)
         
         def predict_proba(self, X):
-            """Predict probabilities."""
-            # Apply variance threshold using pre-fitted selector
-            if self.variance_selector is not None:
-                X_transformed = self.variance_selector.transform(X)
-                feature_mask = self.variance_selector.get_support()
-                feature_names = X.columns[feature_mask].tolist()
-                X = pd.DataFrame(X_transformed, columns=feature_names, index=X.index)
+            """
+            Predict class probabilities for whole image features.
             
-            # Select features
-            available = [f for f in self.feature_subset if f in X.columns]
-            if len(available) == 0:
-                raise ValueError("No features from subset available in X")
-            X = X[available]
+            Args:
+                X: DataFrame with features (all ROIs combined, one row per case)
             
-            # Apply correlation filtering if needed
-            if self.corr_threshold is not None:
-                features_to_keep = filter_correlated_features(
-                    X, threshold=self.corr_threshold
-                )
-                X = X[features_to_keep]
-            
-            # Apply preprocessing
-            X_processed = self.preprocessor.transform(X)
-            
-            # Predict
+            Returns:
+                Array of predicted class probabilities (shape: [n_samples, n_classes])
+            """
+            X_processed = self._process_input(X)
             return self.classifier.predict_proba(X_processed)
+        
+        def get_feature_importance(self):
+            """
+            Get feature importance/coefficients from the classifier.
+            """
+            if hasattr(self.classifier, 'coef_'):
+                return dict(zip(self.feature_subset, self.classifier.coef_[0] if self.classifier.coef_.ndim > 1 else self.classifier.coef_))
+            return None
     
     full_pipeline = FullPipeline(
         variance_threshold=args.variance_threshold,
@@ -1344,7 +1364,7 @@ def main():
         '--input-table',
         type=str,
         default=None,
-        help='Path to input parquet/csv file (from RadiomicsKLGDataLoader)'
+        help='Path to input parquet/csv file with radiomics features. Can be from RadiomicsKLGDataLoader or extracted from predicted masks (using torchradiomics_from_ROIs.py with --mode extract_from_masks).'
     )
     
     # Dataloader mode arguments
@@ -1631,11 +1651,18 @@ def main():
             logger.info(f"Saved combined data to {save_path} for future use")
             logger.info(f"You can use --input-table {save_path} next time for faster loading")
     else:
-        # Load from pre-saved table
+        # Load from pre-saved table (CSV/Parquet)
         if not args.input_table:
             raise ValueError("--input-table is required when not using --use-dataloader")
         logger.info(f"\nLoading data from {args.input_table}...")
+        logger.info("This should be a CSV/Parquet file with radiomics features extracted from predicted masks.")
         df = load_table(args.input_table)
+        
+        # Ensure required columns exist
+        if 'case_id' not in df.columns:
+            raise ValueError("'case_id' column not found in input table")
+        if args.roi_mode == 'per_roi' and 'roi_name' not in df.columns:
+            raise ValueError("'roi_name' column not found in input table (required for per_roi mode)")
     
     # Process ROIs
     if args.roi_mode == 'per_roi':
