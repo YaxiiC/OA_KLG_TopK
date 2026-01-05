@@ -21,6 +21,15 @@ python torchradiomics_from_ROIs.py `
   --split train `
   --output-format csv `
   --max-cases 5
+
+python torchradiomics_from_ROIs.py \
+  --images-dir "/home/yaxi/nnUNet/nnUNet_raw/Dataset360_oaizib/imagesTr" \
+  --predicted-masks-dir "/home/yaxi/nnUNet/nnUNet_results/predicted_masks/train" \
+  --output-dir "output" \
+  --split train \
+  --output-format csv \
+  --max-cases 5
+
 """
 
 import os
