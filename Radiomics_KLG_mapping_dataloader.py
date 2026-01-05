@@ -150,14 +150,12 @@ def process_case_gt(
     
     # Load image
     sitk_image = sitk.ReadImage(str(case_image_path))
-    image_array = sitk.GetArrayFromImage(sitk_image)
-    image_tensor = torch.from_numpy(image_array).float()
     
     # Load ground truth label
     sitk_label = sitk.ReadImage(str(case_label_path))
     label_array = sitk.GetArrayFromImage(sitk_label)
     
-    # Get spacing (SITK order is x,y,z, but we need z,y,x)
+    # Get spacing (SITK order is x,y,z, but we need z,y,x for compatibility)
     spacing_xyz = sitk_image.GetSpacing()
     spacing_zyx = [spacing_xyz[2], spacing_xyz[1], spacing_xyz[0]]
     
@@ -174,12 +172,16 @@ def process_case_gt(
     for roi_name, roi_mask in rois.items():
         logger.info(f"  Extracting radiomics for {roi_name}...")
         
-        roi_mask_tensor = torch.from_numpy(roi_mask).float()
+        # Create SimpleITK mask for this ROI
+        roi_mask_sitk = sitk.GetImageFromArray(roi_mask.astype(np.uint8))
+        roi_mask_sitk.SetSpacing(sitk_label.GetSpacing())
+        roi_mask_sitk.SetOrigin(sitk_label.GetOrigin())
+        roi_mask_sitk.SetDirection(sitk_label.GetDirection())
         
         try:
             features_dict, feature_names = extract_radiomics_with_groups(
-                image_tensor,
-                roi_mask_tensor,
+                sitk_image,
+                roi_mask_sitk,
                 voxelArrayShift=voxelArrayShift,
                 pixelSpacing=spacing_zyx,
                 binWidth=binWidth,
@@ -189,9 +191,6 @@ def process_case_gt(
             
             # Convert to DataFrame rows
             for feat_name, feat_value in features_dict.items():
-                if isinstance(feat_value, torch.Tensor):
-                    feat_value = feat_value.item()
-                
                 # Check for invalid values
                 if math.isnan(feat_value) or math.isinf(feat_value):
                     logger.warning(f"  Invalid feature {feat_name} for {roi_name}: {feat_value}")

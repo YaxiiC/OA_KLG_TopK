@@ -15,7 +15,7 @@ python nnunet_segmentation_inference.py \
     --model-dir "/home/yaxi/nnUNet/nnUNet_results/Dataset360_oaizib/nnUNetTrainer__nnUNetPlans__3d_fullres" \
     --output-dir "/home/yaxi/nnUNet/nnUNet_results" \
     --split both \
-    --folds 0
+    --folds 0 1 2 3 4 
 """
 
 import torch
