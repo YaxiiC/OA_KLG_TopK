@@ -5,10 +5,17 @@ This script:
 1. Runs inference on each fold separately (0, 1, 2, 3, 4)
 2. Performs majority voting across folds to get final segmentation
 3. Saves only the majority-voted mask
-4. Calculates Dice score and HD95 for all ROIs
+4. Calculates Dice score for all ROIs
 5. Processes both train and test sets
 
 Author: Created for Dataset360_oaizib segmentation
+
+python nnunet_segmentation_inference.py \
+    --dataset-dir "/home/yaxi/nnUNet/nnUNet_raw/Dataset360_oaizib" \
+    --model-dir "/home/yaxi/nnUNet/nnUNet_results/Dataset360_oaizib/nnUNetTrainer__nnUNetPlans__3d_fullres" \
+    --output-dir "/home/yaxi/nnUNet/nnUNet_results" \
+    --split both \
+    --folds 0
 """
 
 import torch
@@ -18,7 +25,6 @@ import argparse
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 from scipy import stats
-from scipy.spatial.distance import directed_hausdorff
 import SimpleITK as sitk
 
 # nnU-Net imports
@@ -149,74 +155,21 @@ def calculate_dice(pred: np.ndarray, gt: np.ndarray, label: int) -> float:
     return float(dice)
 
 
-def calculate_hd95(pred: np.ndarray, gt: np.ndarray, label: int, spacing: Tuple[float, float, float]) -> float:
-    """
-    Calculate 95th percentile Hausdorff distance for a specific label.
-    
-    Args:
-        pred: Prediction array
-        gt: Ground truth array
-        label: Label value to evaluate
-        spacing: Voxel spacing (z, y, x) in mm
-    
-    Returns:
-        HD95 in mm (lower is better, returns inf if either mask is empty)
-    """
-    pred_mask = (pred == label).astype(bool)
-    gt_mask = (gt == label).astype(bool)
-    
-    # Check if masks are empty
-    if not np.any(pred_mask) or not np.any(gt_mask):
-        return float('inf')
-    
-    # Get coordinates of surface points
-    pred_coords = np.argwhere(pred_mask)
-    gt_coords = np.argwhere(gt_mask)
-    
-    # Apply spacing to convert voxel coordinates to physical coordinates (mm)
-    pred_coords_mm = pred_coords * np.array(spacing)
-    gt_coords_mm = gt_coords * np.array(spacing)
-    
-    # Calculate distances from pred to gt
-    distances_pred_to_gt = []
-    for pred_point in pred_coords_mm:
-        dists = np.sqrt(np.sum((gt_coords_mm - pred_point)**2, axis=1))
-        distances_pred_to_gt.append(np.min(dists))
-    
-    # Calculate distances from gt to pred
-    distances_gt_to_pred = []
-    for gt_point in gt_coords_mm:
-        dists = np.sqrt(np.sum((pred_coords_mm - gt_point)**2, axis=1))
-        distances_gt_to_pred.append(np.min(dists))
-    
-    # Combine distances
-    all_distances = distances_pred_to_gt + distances_gt_to_pred
-    
-    if len(all_distances) == 0:
-        return float('inf')
-    
-    # Calculate 95th percentile
-    hd95 = np.percentile(all_distances, 95)
-    return float(hd95)
-
-
 def calculate_metrics_all_rois(
     pred: np.ndarray,
     gt: np.ndarray,
-    spacing: Tuple[float, float, float],
     roi_labels: Optional[Dict[int, str]] = None
 ) -> Dict[str, Dict[str, float]]:
     """
-    Calculate Dice and HD95 for all ROIs.
+    Calculate Dice score for all ROIs.
     
     Args:
         pred: Prediction array
         gt: Ground truth array
-        spacing: Voxel spacing (z, y, x) in mm
         roi_labels: Optional dict mapping label value -> ROI name
     
     Returns:
-        Dictionary mapping ROI name -> {'dice': float, 'hd95': float}
+        Dictionary mapping ROI name -> {'dice': float, 'label': int}
     """
     # Get unique labels (excluding background 0)
     unique_labels = np.unique(gt)
@@ -232,11 +185,9 @@ def calculate_metrics_all_rois(
         roi_name = roi_labels.get(label_int, f'ROI_{label_int}')
         
         dice = calculate_dice(pred, gt, label_int)
-        hd95 = calculate_hd95(pred, gt, label_int, spacing)
         
         metrics[roi_name] = {
             'dice': dice,
-            'hd95': hd95,
             'label': label_int
         }
     
@@ -369,23 +320,17 @@ def process_case(
         gt_sitk = sitk.ReadImage(str(gt_label_path))
         gt_array = sitk.GetArrayFromImage(gt_sitk)
         
-        # Get spacing (SITK order is x,y,z, but we need z,y,x)
-        spacing_xyz = gt_sitk.GetSpacing()
-        spacing_zyx = (spacing_xyz[2], spacing_xyz[1], spacing_xyz[0])
-        
         # Calculate metrics for all ROIs
-        metrics = calculate_metrics_all_rois(majority_seg, gt_array, spacing_zyx, roi_labels)
+        metrics = calculate_metrics_all_rois(majority_seg, gt_array, roi_labels)
         result['metrics'] = metrics
         
         # Print metrics
         logger.info("\nMetrics:")
-        logger.info(f"{'ROI':<30} {'Dice':<10} {'HD95 (mm)':<12}")
-        logger.info("-" * 55)
+        logger.info(f"{'ROI':<30} {'Dice':<10}")
+        logger.info("-" * 45)
         for roi_name, roi_metrics in metrics.items():
             dice = roi_metrics['dice']
-            hd95 = roi_metrics['hd95']
-            hd95_str = f"{hd95:.2f}" if hd95 != float('inf') else "inf"
-            logger.info(f"{roi_name:<30} {dice:<10.4f} {hd95_str:<12}")
+            logger.info(f"{roi_name:<30} {dice:<10.4f}")
     else:
         logger.warning(f"Ground truth not found at {gt_label_path}, skipping metrics calculation")
         result['metrics'] = None
@@ -595,10 +540,8 @@ def main():
                     if result.get('metrics'):
                         for roi_name, roi_metrics in result['metrics'].items():
                             if roi_name not in split_metrics:
-                                split_metrics[roi_name] = {'dice': [], 'hd95': []}
+                                split_metrics[roi_name] = {'dice': []}
                             split_metrics[roi_name]['dice'].append(roi_metrics['dice'])
-                            if roi_metrics['hd95'] != float('inf'):
-                                split_metrics[roi_name]['hd95'].append(roi_metrics['hd95'])
                 else:
                     failed += 1
                     logger.warning(f"Failed to process {image_path.name}")
@@ -616,17 +559,13 @@ def main():
         
         if split_metrics:
             logger.info(f"\n{split.upper()} Split - Average Metrics:")
-            logger.info(f"{'ROI':<30} {'Mean Dice':<12} {'Std Dice':<12} {'Mean HD95 (mm)':<15} {'Std HD95 (mm)':<15}")
-            logger.info("-" * 85)
+            logger.info(f"{'ROI':<30} {'Mean Dice':<12} {'Std Dice':<12}")
+            logger.info("-" * 55)
             for roi_name in sorted(split_metrics.keys()):
                 dice_values = split_metrics[roi_name]['dice']
-                hd95_values = split_metrics[roi_name]['hd95']
                 mean_dice = np.mean(dice_values)
                 std_dice = np.std(dice_values)
-                mean_hd95 = np.mean(hd95_values) if len(hd95_values) > 0 else float('inf')
-                std_hd95 = np.std(hd95_values) if len(hd95_values) > 0 else float('inf')
-                hd95_str = f"{mean_hd95:.2f} ± {std_hd95:.2f}" if mean_hd95 != float('inf') else "inf"
-                logger.info(f"{roi_name:<30} {mean_dice:<12.4f} {std_dice:<12.4f} {hd95_str:<15}")
+                logger.info(f"{roi_name:<30} {mean_dice:<12.4f} {std_dice:<12.4f}")
             all_metrics_summary[split] = split_metrics
     
     # Overall summary
@@ -638,25 +577,21 @@ def main():
     
     if all_metrics_summary:
         logger.info("\nOverall Average Metrics (across all splits):")
-        logger.info(f"{'ROI':<30} {'Mean Dice':<12} {'Mean HD95 (mm)':<15}")
-        logger.info("-" * 60)
+        logger.info(f"{'ROI':<30} {'Mean Dice':<12}")
+        logger.info("-" * 45)
         
         # Aggregate across all splits
         overall_metrics = {}
         for split, split_metrics in all_metrics_summary.items():
             for roi_name, roi_metrics in split_metrics.items():
                 if roi_name not in overall_metrics:
-                    overall_metrics[roi_name] = {'dice': [], 'hd95': []}
+                    overall_metrics[roi_name] = {'dice': []}
                 overall_metrics[roi_name]['dice'].extend(roi_metrics['dice'])
-                overall_metrics[roi_name]['hd95'].extend(roi_metrics['hd95'])
         
         for roi_name in sorted(overall_metrics.keys()):
             dice_values = overall_metrics[roi_name]['dice']
-            hd95_values = overall_metrics[roi_name]['hd95']
             mean_dice = np.mean(dice_values)
-            mean_hd95 = np.mean(hd95_values) if len(hd95_values) > 0 else float('inf')
-            hd95_str = f"{mean_hd95:.2f}" if mean_hd95 != float('inf') else "inf"
-            logger.info(f"{roi_name:<30} {mean_dice:<12.4f} {hd95_str:<15}")
+            logger.info(f"{roi_name:<30} {mean_dice:<12.4f}")
     
     logger.info("\nDone!")
 
