@@ -7,8 +7,7 @@ This guide helps you set up the Python environment for running the radiomics ext
 - **CUDA**: nnU-Net and PyTorch Radiomics require CUDA for GPU acceleration
   - Check your CUDA version: `nvidia-smi` or `nvcc --version`
   - Recommended: CUDA 11.8 or 12.1
-- **Python**: 3.7 (required for pyradiomics compatibility)
-  - Note: Some newer package versions may not support Python 3.7, so version constraints are set accordingly
+- **Python**: 3.9 (recommended for compatibility with all packages)
 
 ## Option 1: Using Conda (Recommended)
 
@@ -222,15 +221,13 @@ if torch.cuda.is_available():
 print("All core packages imported successfully!")
 ```
 
-## Python 3.7 Compatibility Notes
+## Python 3.9 Compatibility Notes
 
-Since Python 3.7 is required for pyradiomics, some package versions have been constrained:
-- **numpy**: <1.24.0 (numpy 1.24+ requires Python 3.8+)
-- **pandas**: <2.0.0 (pandas 2.0+ requires Python 3.8+)
-- **scikit-learn**: <1.2.0 (scikit-learn 1.2+ requires Python 3.8+)
-- **scipy**: <1.10.0 (scipy 1.10+ requires Python 3.8+)
-
-If you encounter compatibility issues, you may need to adjust these version constraints.
+Python 3.9 provides good compatibility with all required packages:
+- Supports all modern versions of numpy, pandas, scikit-learn, and scipy
+- Compatible with PyTorch 2.0+
+- Works with nnU-Net v2 and torchradiomics
+- If you specifically need pyradiomics (which requires Python 3.7), you may need to create a separate environment or use Python 3.7
 
 ## Environment Variables (Optional)
 
