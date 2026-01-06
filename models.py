@@ -1,0 +1,236 @@
+"""
+Model Definitions for Image-Conditioned Feature Selector + KLGrade Classifier
+
+This module contains:
+- FeatureSelector: 3D CNN-based feature selector
+- KLGradeClassifier: Simple linear classifier for KLGrade
+- JointModel: Combined selector + classifier with two-stage gating
+"""
+
+import logging
+from typing import Tuple, Union
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# Try to import torchvision for pretrained models
+try:
+    import torchvision.models.video as video_models
+    HAS_TORCHVISION = True
+except ImportError:
+    HAS_TORCHVISION = False
+    logging.warning("torchvision not available, pretrained models disabled")
+
+logger = logging.getLogger(__name__)
+
+
+class FeatureSelector(nn.Module):
+    """3D CNN-based feature selector."""
+    
+    def __init__(
+        self,
+        n_features: int = 535,
+        pretrained: bool = False,
+        backbone_name: str = "r3d_18"
+    ):
+        """
+        Args:
+            n_features: Number of radiomics features to gate
+            pretrained: Whether to use pretrained weights
+            backbone_name: Backbone model name
+        """
+        super().__init__()
+        self.n_features = n_features
+        
+        if not HAS_TORCHVISION and pretrained:
+            logger.warning("torchvision not available, using random initialization")
+            pretrained = False
+        
+        # Backbone: 3D CNN
+        if HAS_TORCHVISION and backbone_name == "r3d_18" and pretrained:
+            backbone = video_models.r3d_18(pretrained=True)
+            # Replace first conv for 1-channel input
+            old_conv = backbone.stem[0]
+            new_conv = nn.Conv3d(
+                1, old_conv.out_channels,
+                kernel_size=old_conv.kernel_size,
+                stride=old_conv.stride,
+                padding=old_conv.padding,
+                bias=old_conv.bias is not None
+            )
+            # Initialize by averaging RGB weights
+            with torch.no_grad():
+                new_conv.weight.data = old_conv.weight.data.mean(dim=1, keepdim=True)
+                if old_conv.bias is not None:
+                    new_conv.bias.data = old_conv.bias.data
+            backbone.stem[0] = new_conv
+            # Get feature dimension
+            backbone.fc = nn.Identity()  # Remove classifier
+            # Test forward pass to get feature dim
+            with torch.no_grad():
+                test_input = torch.randn(1, 1, 32, 128, 128)
+                test_output = backbone(test_input)
+                feature_dim = test_output.shape[1]
+        else:
+            # Simple 3D CNN backbone
+            feature_dim = 512
+            backbone = nn.Sequential(
+                nn.Conv3d(1, 32, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.MaxPool3d(2),
+                nn.Conv3d(32, 64, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.MaxPool3d(2),
+                nn.Conv3d(64, 128, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.AdaptiveAvgPool3d(1),
+                nn.Flatten(),
+                nn.Linear(128, feature_dim),
+                nn.ReLU(inplace=True)
+            )
+        
+        self.backbone = backbone
+        
+        # Gate head: outputs logits for each feature
+        self.gate_head = nn.Sequential(
+            nn.Linear(feature_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(256, n_features)
+        )
+    
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            image: Tensor of shape [B, 1, D, H, W]
+        
+        Returns:
+            Gate logits of shape [B, n_features]
+        """
+        features = self.backbone(image)  # [B, feature_dim]
+        gate_logits = self.gate_head(features)  # [B, n_features]
+        return gate_logits
+
+
+class KLGradeClassifier(nn.Module):
+    """
+    Logistic Regression Classifier for KLGrade.
+    
+    This implements multiclass logistic regression (softmax regression) using
+    a linear layer. When combined with CrossEntropyLoss, this is equivalent to
+    standard logistic regression for multiclass classification.
+    
+    The model learns: logits = X @ W + b, where:
+    - X: input features (masked radiomics) [B, n_features]
+    - W: weight matrix [n_features, n_classes]
+    - b: bias vector [n_classes]
+    
+    Probabilities are computed via softmax: P(class_i) = exp(logits_i) / sum(exp(logits))
+    """
+    
+    def __init__(self, n_features: int = 535, n_classes: int = 5):
+        """
+        Args:
+            n_features: Number of input features (selected radiomics)
+            n_classes: Number of output classes (KLGrade 0-4)
+        """
+        super().__init__()
+        # Linear layer implements: y = XW^T + b
+        # This is the standard logistic regression formulation
+        self.classifier = nn.Linear(n_features, n_classes)
+    
+    def forward(self, masked_radiomics: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass: computes logits for multiclass logistic regression.
+        
+        Args:
+            masked_radiomics: Tensor of shape [B, n_features]
+        
+        Returns:
+            Logits of shape [B, n_classes] (before softmax)
+            Note: Use F.softmax(logits, dim=1) to get probabilities
+        """
+        return self.classifier(masked_radiomics)
+
+
+class JointModel(nn.Module):
+    """Joint feature selector + classifier model."""
+    
+    def __init__(
+        self,
+        n_features: int = 535,
+        n_classes: int = 5,
+        pretrained: bool = False,
+        k: int = 15,
+        warmup_threshold: float = 0.0,
+        use_hard_topk: bool = False
+    ):
+        """
+        Args:
+            n_features: Number of radiomics features
+            n_classes: Number of KLGrade classes
+            pretrained: Whether to use pretrained backbone
+            k: Top-k for hard gating
+            warmup_threshold: Threshold for soft gating during warmup
+            use_hard_topk: Whether to use hard top-k (True) or soft gating (False)
+        """
+        super().__init__()
+        self.n_features = n_features
+        self.n_classes = n_classes
+        self.k = k
+        self.warmup_threshold = warmup_threshold
+        self.use_hard_topk = use_hard_topk
+        
+        self.selector = FeatureSelector(n_features, pretrained)
+        self.classifier = KLGradeClassifier(n_features, n_classes)
+    
+    def forward(
+        self,
+        image: torch.Tensor,
+        radiomics: torch.Tensor,
+        return_gates: bool = False
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Args:
+            image: Tensor of shape [B, 1, D, H, W]
+            radiomics: Tensor of shape [B, n_features]
+            return_gates: Whether to return gate values
+        
+        Returns:
+            If return_gates=False: logits [B, n_classes]
+            If return_gates=True: (logits, gates) where gates is [B, n_features]
+        """
+        # Get gate logits
+        gate_logits = self.selector(image)  # [B, n_features]
+        p = torch.sigmoid(gate_logits)  # [B, n_features]
+        
+        # Apply gating
+        if self.use_hard_topk:
+            # Hard top-k with straight-through
+            _, topk_indices = torch.topk(p, self.k, dim=1)  # [B, k]
+            hard_mask = torch.zeros_like(p)
+            hard_mask.scatter_(1, topk_indices, 1.0)
+            # Straight-through estimator
+            mask = hard_mask - p.detach() + p
+            masked_radiomics = radiomics * mask
+        else:
+            # Soft thresholding during warmup
+            p_thr = F.relu(p - self.warmup_threshold)
+            masked_radiomics = radiomics * p_thr
+        
+        # Classify
+        logits = self.classifier(masked_radiomics)
+        
+        if return_gates:
+            return logits, p
+        return logits
+    
+    def set_warmup_threshold(self, threshold: float):
+        """Update warmup threshold."""
+        self.warmup_threshold = threshold
+    
+    def set_use_hard_topk(self, use_hard: bool):
+        """Switch between soft and hard gating."""
+        self.use_hard_topk = use_hard
+
