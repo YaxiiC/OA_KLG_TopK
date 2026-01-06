@@ -19,7 +19,8 @@ python train_selector_klgrade.py `
     --epochs 500 `
     --early-stopping-patience 100 `
     --batch-size 8 `
-    --lr 1e-4
+    --lr 1e-4 `
+    --use-class-weights
 """
 
 import json
