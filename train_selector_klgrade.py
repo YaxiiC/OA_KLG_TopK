@@ -38,6 +38,7 @@ from torch.utils.data import DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import confusion_matrix
+from sklearn.utils.class_weight import compute_class_weight
 import joblib
 from tqdm import tqdm
 import matplotlib
@@ -231,6 +232,11 @@ def main():
                         help="Random seed")
     parser.add_argument("--early-stopping-patience", type=int, default=10,
                         help="Early stopping patience")
+    parser.add_argument("--use-class-weights", action="store_true",
+                        help="Use class weights to handle class imbalance")
+    parser.add_argument("--class-weight-method", type=str, default="balanced",
+                        choices=["balanced", "balanced_subsample"],
+                        help="Method for computing class weights (balanced: inverse frequency)")
     
     args = parser.parse_args()
     
@@ -300,6 +306,36 @@ def main():
         stratify=[labels_train[cid] for cid in train_case_ids]
     )
     logger.info(f"Train: {len(train_ids)}, Val: {len(val_ids)}")
+    
+    # Compute class weights if requested
+    class_weights = None
+    if args.use_class_weights:
+        train_labels_array = np.array([labels_train[cid] for cid in train_ids])
+        classes = np.array([0, 1, 2, 3, 4])
+        
+        # Compute class weights
+        weights = compute_class_weight(
+            class_weight=args.class_weight_method,
+            classes=classes,
+            y=train_labels_array
+        )
+        class_weights = torch.FloatTensor(weights).to(device)
+        
+        # Log class distribution and weights
+        from collections import Counter
+        label_counts = Counter(train_labels_array)
+        logger.info("=" * 80)
+        logger.info("Class Distribution (Training Set):")
+        logger.info("-" * 80)
+        logger.info(f"{'Class':<10} {'Count':<10} {'Weight':<10}")
+        logger.info("-" * 80)
+        for cls in classes:
+            count = label_counts.get(cls, 0)
+            weight = weights[cls]
+            logger.info(f"{cls:<10} {count:<10} {weight:<10.4f}")
+        logger.info("=" * 80)
+    else:
+        logger.info("Class weights disabled (using uniform weights)")
     
     # Normalize radiomics (fit on train only)
     logger.info("Fitting radiomics scaler on training set...")
@@ -389,7 +425,12 @@ def main():
     )
     
     # Criterion
-    criterion = nn.CrossEntropyLoss()
+    if class_weights is not None:
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
+        logger.info(f"Using weighted CrossEntropyLoss with class weights: {class_weights.cpu().numpy()}")
+    else:
+        criterion = nn.CrossEntropyLoss()
+        logger.info("Using standard CrossEntropyLoss (no class weights)")
     
     # Training loop
     logger.info("=" * 80)

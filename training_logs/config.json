@@ -21,5 +21,7 @@
   "num_workers": 4,
   "seed": 42,
   "early_stopping_patience": 100,
-  "timestamp": "2026-01-06T16:33:23.212128"
+  "use_class_weights": true,
+  "class_weight_method": "balanced",
+  "timestamp": "2026-01-06T17:20:16.368256"
 }
