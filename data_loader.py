@@ -9,6 +9,7 @@ This module contains:
 """
 
 import logging
+import re
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
@@ -131,32 +132,97 @@ def load_radiomics_long_format(
     return case_radiomics, all_rois, all_features, missing_stats
 
 
-def load_klgrade_labels(csv_path: Path) -> Dict[str, int]:
+def load_klgrade_labels(file_path: Path) -> Dict[str, int]:
     """
-    Load KLGrade labels from CSV.
+    Load KLGrade labels from CSV or Excel file.
+    
+    The CMT-ID column in the Excel file corresponds to the image naming pattern:
+    oaizib_[CMT-ID]_0000.nii, so case_id is formatted as oaizib_[CMT-ID] where
+    CMT-ID is zero-padded to 3 digits.
     
     Args:
-        csv_path: Path to CSV with columns: case_id, KLGrade
+        file_path: Path to CSV or Excel file with columns: CMT-ID (or similar), KLGrade
     
     Returns:
-        Dict[case_id, KLGrade] where KLGrade is int 0-4
+        Dict[case_id, KLGrade] where case_id is in format oaizib_XXX and KLGrade is int 0-4
     """
-    logger.info(f"Loading KLGrade labels from {csv_path}")
+    logger.info(f"Loading KLGrade labels from {file_path}")
     
-    if not csv_path.exists():
-        raise FileNotFoundError(f"KLGrade CSV not found: {csv_path}")
+    if not file_path.exists():
+        raise FileNotFoundError(f"KLGrade file not found: {file_path}")
     
-    df = pd.read_csv(csv_path)
+    # Load file based on extension
+    if file_path.suffix.lower() == '.xlsx' or file_path.suffix.lower() == '.xls':
+        df = pd.read_excel(file_path)
+    elif file_path.suffix.lower() == '.csv':
+        df = pd.read_csv(file_path)
+    else:
+        raise ValueError(f"Unsupported file format: {file_path.suffix}. Use .csv, .xlsx, or .xls")
     
-    if "case_id" not in df.columns or "KLGrade" not in df.columns:
-        raise ValueError("CSV must have columns: case_id, KLGrade")
+    # Find CMT-ID column (try common variations)
+    cmt_id_col = None
+    for col in df.columns:
+        col_lower = col.lower().strip().replace(' ', '_').replace('-', '_')
+        if col_lower in ['cmt_id', 'cmtid', 'cmt-id', 'cmt']:
+            cmt_id_col = col
+            break
+    
+    # If CMT-ID not found, try other common ID column names
+    if cmt_id_col is None:
+        for col in df.columns:
+            col_lower = col.lower().strip().replace(' ', '_')
+            if col_lower in ['case_id', 'caseid', 'id', 'subject_id', 'subjectid', 'subid', 'sub_id']:
+                cmt_id_col = col
+                break
+    
+    if cmt_id_col is None:
+        # Try first column if no match found
+        logger.warning(f"Could not find CMT-ID or case_id column in {df.columns.tolist()}, using first column: {df.columns[0]}")
+        cmt_id_col = df.columns[0]
+    
+    if "KLGrade" not in df.columns:
+        raise ValueError(f"File must have 'KLGrade' column. Found columns: {df.columns.tolist()}")
     
     labels = {}
     for _, row in df.iterrows():
-        case_id = str(row["case_id"])
-        klgrade = int(row["KLGrade"])
+        # Handle NaN values in CMT-ID
+        if pd.isna(row[cmt_id_col]):
+            logger.warning(f"Missing CMT-ID in row, skipping")
+            continue
+        
+        # Get CMT-ID value
+        cmt_id_raw = str(row[cmt_id_col]).strip()
+        
+        # Convert CMT-ID to case_id format: oaizib_XXX (zero-padded to 3 digits)
+        try:
+            # Try to convert to int first (handles numeric CMT-IDs)
+            cmt_id_int = int(float(cmt_id_raw))  # Use float first to handle "001.0" type strings
+            cmt_id_str = f"{cmt_id_int:03d}"  # Zero-pad to 3 digits
+        except (ValueError, TypeError):
+            # If not numeric, try to extract digits from string
+            digits = re.findall(r'\d+', cmt_id_raw)
+            if digits:
+                cmt_id_int = int(digits[0])
+                cmt_id_str = f"{cmt_id_int:03d}"
+            else:
+                # If no digits found, use as-is (might already be in correct format)
+                cmt_id_str = cmt_id_raw
+        
+        case_id = f"oaizib_{cmt_id_str}"
+        
+        # Handle NaN values in KLGrade
+        if pd.isna(row["KLGrade"]):
+            logger.warning(f"Missing KLGrade for case {case_id} (CMT-ID: {cmt_id_raw}), skipping")
+            continue
+        
+        try:
+            klgrade = int(row["KLGrade"])
+        except (ValueError, TypeError):
+            logger.warning(f"Invalid KLGrade value '{row['KLGrade']}' for case {case_id} (CMT-ID: {cmt_id_raw}), skipping")
+            continue
+        
         if klgrade < 0 or klgrade > 4:
-            logger.warning(f"Invalid KLGrade {klgrade} for case {case_id}, skipping")
+            logger.warning(f"Invalid KLGrade {klgrade} for case {case_id} (CMT-ID: {cmt_id_raw}), skipping")
             continue
         labels[case_id] = klgrade
     

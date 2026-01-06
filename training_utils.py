@@ -15,26 +15,87 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from sklearn.metrics import accuracy_score, f1_score, cohen_kappa_score
+from sklearn.metrics import (
+    accuracy_score, f1_score, cohen_kappa_score, precision_score, 
+    recall_score, balanced_accuracy_score, roc_auc_score, 
+    classification_report, confusion_matrix
+)
 
 from models import JointModel
 
 logger = logging.getLogger(__name__)
 
 
-def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_proba: Optional[np.ndarray] = None) -> Dict[str, float]:
-    """Compute accuracy, macro-F1, and QWK."""
-    acc = accuracy_score(y_true, y_pred)
-    macro_f1 = f1_score(y_true, y_pred, average='macro')
+def compute_metrics(
+    y_true: np.ndarray, 
+    y_pred: np.ndarray, 
+    y_proba: Optional[np.ndarray] = None,
+    return_per_class: bool = False
+) -> Dict:
+    """
+    Compute comprehensive metrics for multiclass classification.
     
-    # QWK (Quadratic Weighted Kappa)
+    Args:
+        y_true: True labels
+        y_pred: Predicted labels
+        y_proba: Predicted probabilities (for AUC calculation)
+        return_per_class: Whether to return per-class metrics
+    
+    Returns:
+        Dictionary with summary metrics and optionally per-class metrics
+    """
+    n_classes = len(np.unique(np.concatenate([y_true, y_pred])))
+    classes = sorted(np.unique(np.concatenate([y_true, y_pred])))
+    
+    # Summary metrics
+    acc = accuracy_score(y_true, y_pred)
+    balanced_acc = balanced_accuracy_score(y_true, y_pred)
+    macro_f1 = f1_score(y_true, y_pred, average='macro')
+    weighted_f1 = f1_score(y_true, y_pred, average='weighted')
     qwk = cohen_kappa_score(y_true, y_pred, weights='quadratic')
+    
+    # AUC (macro-averaged one-vs-rest)
+    auc = None
+    if y_proba is not None and y_proba.shape[1] == n_classes:
+        try:
+            # Use macro-averaged AUC for multiclass
+            auc = roc_auc_score(y_true, y_proba, average='macro', multi_class='ovr')
+        except Exception as e:
+            logger.warning(f"Could not compute AUC: {e}")
     
     metrics = {
         "accuracy": acc,
+        "balanced_accuracy": balanced_acc,
         "macro_f1": macro_f1,
-        "qwk": qwk
+        "weighted_f1": weighted_f1,
+        "qwk": qwk,
     }
+    
+    if auc is not None:
+        metrics["auc"] = auc
+    
+    # Per-class metrics
+    if return_per_class:
+        precision_per_class = precision_score(y_true, y_pred, average=None, labels=classes, zero_division=0)
+        recall_per_class = recall_score(y_true, y_pred, average=None, labels=classes, zero_division=0)
+        f1_per_class = f1_score(y_true, y_pred, average=None, labels=classes, zero_division=0)
+        
+        # Support (number of samples per class in true labels)
+        # Count occurrences of each class in y_true
+        support_dict = {}
+        for cls in classes:
+            support_dict[cls] = int(np.sum(y_true == cls))
+        
+        per_class_metrics = {}
+        for i, cls in enumerate(classes):
+            per_class_metrics[f"class_{cls}"] = {
+                "precision": float(precision_per_class[i]),
+                "recall": float(recall_per_class[i]),
+                "f1": float(f1_per_class[i]),
+                "support": support_dict[cls]
+            }
+        
+        metrics["per_class"] = per_class_metrics
     
     return metrics
 
@@ -50,11 +111,23 @@ def train_epoch(
     lambda_k: float,
     lambda_k_start: float,
     warmup_thr_start: float,
-    warmup_thr_end: float
-) -> Tuple[float, Dict[str, float]]:
-    """Train for one epoch."""
+    warmup_thr_end: float,
+    progress_bar=None
+) -> Tuple[float, Dict[str, float], Dict[str, float]]:
+    """
+    Train for one epoch.
+    
+    Returns:
+        Tuple of (avg_loss, metrics, loss_components) where loss_components contains:
+        - ce_loss: average classification loss
+        - loss_k: average sparsity loss
+        - mean_p_sum: average sum of gate probabilities
+    """
     model.train()
     total_loss = 0.0
+    total_ce_loss = 0.0
+    total_loss_k = 0.0
+    all_p_sums = []
     all_preds = []
     all_labels = []
     
@@ -67,10 +140,15 @@ def train_epoch(
         model.set_warmup_threshold(current_threshold)
         model.set_use_hard_topk(False)
         is_warmup = True
+        stage = "warmup"
     else:
         current_lambda_k = lambda_k
         model.set_use_hard_topk(True)
         is_warmup = False
+        stage = "hard-topk"
+    
+    # Get current learning rate
+    current_lr = optimizer.param_groups[0]['lr']
     
     for batch_idx, batch in enumerate(dataloader):
         images = batch["image"].to(device)
@@ -89,6 +167,9 @@ def train_epoch(
         p = torch.sigmoid(model.selector.gate_head(model.selector.backbone(images)))
         loss_k = ((p.sum(dim=1) - model.k) ** 2).mean()
         
+        # Track p.sum() for gate statistics
+        all_p_sums.extend(p.sum(dim=1).detach().cpu().numpy())
+        
         # Total loss
         loss = loss_cls + current_lambda_k * loss_k
         
@@ -97,6 +178,20 @@ def train_epoch(
         optimizer.step()
         
         total_loss += loss.item()
+        total_ce_loss += loss_cls.item()
+        total_loss_k += loss_k.item()
+        
+        # Update progress bar if provided
+        if progress_bar is not None:
+            progress_bar.set_postfix({
+                'lr': f'{current_lr:.2e}',
+                'loss': f'{loss.item():.4f}',
+                'ce': f'{loss_cls.item():.4f}',
+                'k': f'{loss_k.item():.4f}',
+                'p_sum': f'{p.sum(dim=1).mean().item():.2f}',
+                'stage': stage
+            })
+            progress_bar.update(1)
         
         # Predictions
         preds = logits.argmax(dim=1).cpu().numpy()
@@ -104,20 +199,41 @@ def train_epoch(
         all_labels.extend(labels.cpu().numpy())
     
     avg_loss = total_loss / len(dataloader)
-    metrics = compute_metrics(np.array(all_labels), np.array(all_preds))
+    avg_ce_loss = total_ce_loss / len(dataloader)
+    avg_loss_k = total_loss_k / len(dataloader)
+    mean_p_sum = np.mean(all_p_sums) if all_p_sums else 0.0
     
-    return avg_loss, metrics
+    # Note: train_epoch doesn't compute probabilities, so AUC won't be available
+    metrics = compute_metrics(np.array(all_labels), np.array(all_preds), y_proba=None)
+    
+    loss_components = {
+        'ce_loss': avg_ce_loss,
+        'loss_k': avg_loss_k,
+        'mean_p_sum': mean_p_sum
+    }
+    
+    return avg_loss, metrics, loss_components
 
 
 def validate(
     model: JointModel,
     dataloader: DataLoader,
     criterion: nn.Module,
-    device: torch.device
-) -> Tuple[float, Dict[str, float], Dict[str, np.ndarray]]:
-    """Validate model."""
+    device: torch.device,
+    lambda_k: float = 0.05
+) -> Tuple[float, Dict[str, float], Dict[str, np.ndarray], Dict[str, float]]:
+    """
+    Validate model.
+    
+    Returns:
+        Tuple of (avg_loss, metrics, results, loss_components) where loss_components contains:
+        - ce_loss: average classification loss
+        - loss_k: average sparsity loss (if computed)
+    """
     model.eval()
     total_loss = 0.0
+    total_ce_loss = 0.0
+    total_loss_k = 0.0
     all_preds = []
     all_labels = []
     all_probas = []
@@ -129,9 +245,16 @@ def validate(
             labels = batch["label"].to(device)
             
             logits = model(images, radiomics)
-            loss = criterion(logits, labels)
+            loss_cls = criterion(logits, labels)
+            
+            # Compute loss_k for consistency (though not used in validation loss)
+            p = torch.sigmoid(model.selector.gate_head(model.selector.backbone(images)))
+            loss_k = ((p.sum(dim=1) - model.k) ** 2).mean()
+            loss = loss_cls + lambda_k * loss_k
             
             total_loss += loss.item()
+            total_ce_loss += loss_cls.item()
+            total_loss_k += loss_k.item()
             
             probas = F.softmax(logits, dim=1)
             preds = logits.argmax(dim=1).cpu().numpy()
@@ -141,17 +264,29 @@ def validate(
             all_probas.append(probas.cpu().numpy())
     
     avg_loss = total_loss / len(dataloader)
+    avg_ce_loss = total_ce_loss / len(dataloader)
+    avg_loss_k = total_loss_k / len(dataloader)
+    y_true_array = np.array(all_labels)
+    y_pred_array = np.array(all_preds)
+    y_proba_array = np.vstack(all_probas) if all_probas else None
+    
     metrics = compute_metrics(
-        np.array(all_labels),
-        np.array(all_preds),
-        np.vstack(all_probas) if all_probas else None
+        y_true_array,
+        y_pred_array,
+        y_proba_array,
+        return_per_class=False
     )
     
     results = {
-        "preds": np.array(all_preds),
-        "labels": np.array(all_labels),
-        "probas": np.vstack(all_probas) if all_probas else np.array([])
+        "preds": y_pred_array,
+        "labels": y_true_array,
+        "probas": y_proba_array if y_proba_array is not None else np.array([])
     }
     
-    return avg_loss, metrics, results
+    loss_components = {
+        'ce_loss': avg_ce_loss,
+        'loss_k': avg_loss_k
+    }
+    
+    return avg_loss, metrics, results, loss_components
 

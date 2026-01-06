@@ -1,4 +1,4 @@
-"""
+r"""
 Joint Training: Image-Conditioned Feature Selector + KLGrade Classifier
 
 Main training script that orchestrates:
@@ -7,25 +7,27 @@ Main training script that orchestrates:
 3. Training loop with two-stage gating
 4. Inference and saving results
 
-Example usage:
-    python train_selector_klgrade.py `
-        --images-tr "C:\Users\chris\MICCAI2026\nnUNet\nnUNet_raw\Dataset360_oaizib\imagesTr" `
-        --images-ts "C:\Users\chris\MICCAI2026\nnUNet\nnUNet_raw\Dataset360_oaizib\imagesTs" `
-        --radiomics-train-csv "C:\Users\chris\MICCAI2026\OA_KLG_TopK\output_train\radiomics_results.csv" `
-        --radiomics-test-csv "C:\Users\chris\MICCAI2026\OA_KLG_TopK\output_test\radiomics_results.csv" `
-        --klgrade-train-csv "C:\Users\chris\MICCAI2026\labels\klgrade_train.csv" `
-        --outdir "output_training" `
-        --k 15 `
-        --warmup-epochs 20 `
-        --epochs 100 `
-        --batch-size 8 `
-        --lr 1e-4
+python train_selector_klgrade.py `
+    --images-tr "C:\Users\chris\MICCAI2026\nnUNet\nnUNet_raw\Dataset360_oaizib\imagesTr" `
+    --images-ts "C:\Users\chris\MICCAI2026\nnUNet\nnUNet_raw\Dataset360_oaizib\imagesTs" `
+    --radiomics-train-csv "C:\Users\chris\MICCAI2026\OA_KLG_TopK\output_train\radiomics_results.csv" `
+    --radiomics-test-csv "C:\Users\chris\MICCAI2026\OA_KLG_TopK\output_test\radiomics_results.csv" `
+    --klgrade-train-csv "C:\Users\chris\MICCAI2026\OA_KLG_TopK\subInfo_train.xlsx" `
+    --outdir "training_logs" `
+    --k 15 `
+    --warmup-epochs 30 `
+    --epochs 500 `
+    --early-stopping-patience 100 `
+    --batch-size 8 `
+    --lr 1e-4
 """
 
 import json
 import argparse
 import logging
+import time
 from pathlib import Path
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -35,7 +37,12 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import confusion_matrix
 import joblib
+from tqdm import tqdm
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend
+import matplotlib.pyplot as plt
 
 # Import from separate modules
 from models import JointModel
@@ -44,7 +51,7 @@ from data_loader import (
     load_klgrade_labels,
     KLGradeDataset
 )
-from training_utils import train_epoch, validate
+from training_utils import train_epoch, validate, compute_metrics
 
 # Configure logging
 logging.basicConfig(
@@ -52,6 +59,119 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+def plot_loss_curve(history_df: pd.DataFrame, save_path: Path):
+    """Plot train vs val total loss."""
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.plot(history_df['epoch'], history_df['train_loss'], label='Train', linewidth=2)
+    ax.plot(history_df['epoch'], history_df['val_loss'], label='Val', linewidth=2)
+    ax.set_xlabel('Epoch', fontsize=12)
+    ax.set_ylabel('Loss', fontsize=12)
+    ax.set_title('Training and Validation Loss', fontsize=14, fontweight='bold')
+    ax.legend(fontsize=11)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def plot_loss_components(history_df: pd.DataFrame, save_path: Path):
+    """Plot CE loss and loss_k components."""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # CE loss
+    ax1.plot(history_df['epoch'], history_df['train_ce_loss'], label='Train CE', linewidth=2)
+    ax1.plot(history_df['epoch'], history_df['val_ce_loss'], label='Val CE', linewidth=2)
+    ax1.set_xlabel('Epoch', fontsize=12)
+    ax1.set_ylabel('CE Loss', fontsize=12)
+    ax1.set_title('Classification Loss', fontsize=13, fontweight='bold')
+    ax1.legend(fontsize=11)
+    ax1.grid(True, alpha=0.3)
+    
+    # Loss K
+    ax2.plot(history_df['epoch'], history_df['train_loss_k'], label='Train Loss_K', linewidth=2, color='orange')
+    ax2.set_xlabel('Epoch', fontsize=12)
+    ax2.set_ylabel('Loss_K', fontsize=12)
+    ax2.set_title('Sparsity Regularization Loss', fontsize=13, fontweight='bold')
+    ax2.legend(fontsize=11)
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def plot_metrics_curve(history_df: pd.DataFrame, save_path: Path):
+    """Plot validation metrics: acc, macro-F1, QWK."""
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.plot(history_df['epoch'], history_df['val_acc'], label='Val Accuracy', linewidth=2, marker='o', markersize=3)
+    ax.plot(history_df['epoch'], history_df['val_macro_f1'], label='Val Macro F1', linewidth=2, marker='s', markersize=3)
+    ax.plot(history_df['epoch'], history_df['val_qwk'], label='Val QWK', linewidth=2, marker='^', markersize=3)
+    ax.set_xlabel('Epoch', fontsize=12)
+    ax.set_ylabel('Metric Value', fontsize=12)
+    ax.set_title('Validation Metrics', fontsize=14, fontweight='bold')
+    ax.legend(fontsize=11)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def plot_gate_stats(history_df: pd.DataFrame, save_path: Path, target_k: int = 15):
+    """Plot mean p.sum() vs epoch."""
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.plot(history_df['epoch'], history_df['mean_p_sum'], label='Mean p.sum()', linewidth=2, color='purple', marker='o', markersize=3)
+    ax.axhline(y=target_k, 
+               color='r', linestyle='--', label=f'Target k={target_k}', alpha=0.7)
+    ax.set_xlabel('Epoch', fontsize=12)
+    ax.set_ylabel('Mean p.sum()', fontsize=12)
+    ax.set_title('Gate Statistics: Mean Sum of Gate Probabilities', fontsize=14, fontweight='bold')
+    ax.legend(fontsize=11)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def plot_confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray, save_path: Path, normalize: bool = False):
+    """Plot confusion matrix."""
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1, 2, 3, 4])
+    
+    if normalize:
+        cm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+        title = 'Normalized Confusion Matrix'
+        fmt = '.2f'
+    else:
+        title = 'Confusion Matrix'
+        fmt = 'd'
+    
+    fig, ax = plt.subplots(figsize=(8, 7))
+    im = ax.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+    ax.figure.colorbar(im, ax=ax)
+    
+    ax.set(xticks=np.arange(cm.shape[1]),
+           yticks=np.arange(cm.shape[0]),
+           xticklabels=[0, 1, 2, 3, 4],
+           yticklabels=[0, 1, 2, 3, 4],
+           title=title,
+           ylabel='True Label',
+           xlabel='Predicted Label')
+    
+    # Rotate labels
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+    
+    # Add text annotations
+    thresh = cm.max() / 2.
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(j, i, format(cm[i, j], fmt),
+                   ha="center", va="center",
+                   color="white" if cm[i, j] > thresh else "black")
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
 
 
 def main():
@@ -70,7 +190,7 @@ def main():
     parser.add_argument("--radiomics-test-csv", type=str, required=True,
                         help="Test radiomics CSV (long format)")
     parser.add_argument("--klgrade-train-csv", type=str, required=True,
-                        help="Training KLGrade labels CSV")
+                        help="Training KLGrade labels file (CSV or Excel .xlsx)")
     parser.add_argument("--outdir", type=str, required=True,
                         help="Output directory")
     
@@ -127,9 +247,19 @@ def main():
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
     
-    # Create output directory
+    # Create output directories
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
+    (outdir / "logs").mkdir(exist_ok=True)
+    (outdir / "plots").mkdir(exist_ok=True)
+    (outdir / "checkpoints").mkdir(exist_ok=True)
+    
+    # Save config.json
+    config_dict = vars(args)
+    config_dict['timestamp'] = datetime.now().isoformat()
+    with open(outdir / "config.json", "w") as f:
+        json.dump(config_dict, f, indent=2)
+    logger.info(f"Saved config to {outdir / 'config.json'}")
     
     # Load data
     logger.info("=" * 80)
@@ -151,9 +281,9 @@ def main():
     for idx, (roi, feat) in enumerate([(r, f) for r in roi_names for f in feature_names]):
         feature_mapping[idx] = f"{roi}:{feat}"
     
-    with open(outdir / "feature_names.json", "w") as f:
+    with open(outdir / "checkpoints" / "feature_names.json", "w") as f:
         json.dump(feature_mapping, f, indent=2)
-    logger.info(f"Saved feature mapping to {outdir / 'feature_names.json'}")
+    logger.info(f"Saved feature mapping to {outdir / 'checkpoints/feature_names.json'}")
     
     # Load labels
     labels_train = load_klgrade_labels(Path(args.klgrade_train_csv))
@@ -187,8 +317,8 @@ def main():
         radiomics_test[cid] = scaler.transform(radiomics_test[cid].reshape(1, -1))[0]
     
     # Save scaler
-    joblib.dump(scaler, outdir / "radiomics_scaler.joblib")
-    logger.info(f"Saved scaler to {outdir / 'radiomics_scaler.joblib'}")
+    joblib.dump(scaler, outdir / "checkpoints" / "scaler.joblib")
+    logger.info(f"Saved scaler to {outdir / 'checkpoints/scaler.joblib'}")
     
     # Create datasets
     train_dataset = KLGradeDataset(
@@ -267,12 +397,22 @@ def main():
     logger.info("=" * 80)
     
     best_val_f1 = -1.0
+    best_epoch = 0
     patience_counter = 0
     train_history = []
+    best_confusion_matrix_data = None
     
     for epoch in range(1, args.epochs + 1):
-        # Train
-        train_loss, train_metrics = train_epoch(
+        epoch_start_time = time.time()
+        
+        # Determine stage
+        is_warmup = epoch <= args.warmup_epochs
+        stage = "warmup" if is_warmup else "hard-topk"
+        
+        # Train with tqdm progress bar
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs} [{stage}]", 
+                   ncols=120, leave=False)
+        train_loss, train_metrics, train_loss_components = train_epoch(
             model,
             train_loader,
             optimizer,
@@ -283,45 +423,127 @@ def main():
             args.lambda_k,
             args.lambda_k_start,
             args.warmup_thr_start,
-            args.warmup_thr_end
+            args.warmup_thr_end,
+            progress_bar=pbar
         )
+        pbar.close()
         
         # Validate
-        val_loss, val_metrics, _ = validate(model, val_loader, criterion, device)
-        
-        # Log
-        is_warmup = epoch <= args.warmup_epochs
-        stage = "WARMUP" if is_warmup else "HARD-TOPK"
-        logger.info(
-            f"Epoch {epoch:3d}/{args.epochs} [{stage}] | "
-            f"Train Loss: {train_loss:.4f} | Train Acc: {train_metrics['accuracy']:.4f} | Train F1: {train_metrics['macro_f1']:.4f} | "
-            f"Val Loss: {val_loss:.4f} | Val Acc: {val_metrics['accuracy']:.4f} | Val F1: {val_metrics['macro_f1']:.4f} | Val QWK: {val_metrics['qwk']:.4f}"
+        val_loss, val_metrics, val_results, val_loss_components = validate(
+            model, val_loader, criterion, device, args.lambda_k
         )
         
-        train_history.append({
-            "epoch": epoch,
-            "train_loss": train_loss,
-            "train_acc": train_metrics["accuracy"],
-            "train_f1": train_metrics["macro_f1"],
-            "val_loss": val_loss,
-            "val_acc": val_metrics["accuracy"],
-            "val_f1": val_metrics["macro_f1"],
-            "val_qwk": val_metrics["qwk"]
-        })
+        epoch_time = time.time() - epoch_start_time
+        current_lr = optimizer.param_groups[0]['lr']
         
-        # Early stopping
-        if val_metrics["macro_f1"] > best_val_f1:
+        # Check if best model
+        is_best = val_metrics["macro_f1"] > best_val_f1
+        if is_best:
             best_val_f1 = val_metrics["macro_f1"]
+            best_epoch = epoch
+            best_confusion_matrix_data = (val_results["labels"], val_results["preds"])
+        
+        # Log per-epoch summary
+        best_flag = " [BEST]" if is_best else ""
+        logger.info(
+            f"Epoch {epoch:3d}/{args.epochs} [{stage.upper()}]{best_flag} | "
+            f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
+            f"Val Acc: {val_metrics['accuracy']:.4f} | Val F1: {val_metrics['macro_f1']:.4f} | "
+            f"Val QWK: {val_metrics['qwk']:.4f} | Time: {epoch_time:.1f}s"
+        )
+        
+        # Print per-class metrics every 10 epochs
+        if epoch % 10 == 0:
+            logger.info("")
+            logger.info("-" * 80)
+            logger.info(f"PER-CLASS METRICS (Epoch {epoch})")
+            logger.info("-" * 80)
+            
+            # Compute per-class metrics for validation set
+            val_metrics_detailed = compute_metrics(
+                val_results["labels"],
+                val_results["preds"],
+                val_results["probas"] if len(val_results["probas"]) > 0 else None,
+                return_per_class=True
+            )
+            
+            # Print per-class metrics
+            logger.info(f"{'Class':<10} {'Precision':<12} {'Recall':<12} {'F1':<12} {'Support':<10}")
+            logger.info("-" * 80)
+            
+            if "per_class" in val_metrics_detailed:
+                for class_key in sorted(val_metrics_detailed["per_class"].keys()):
+                    class_num = class_key.split("_")[1]
+                    metrics = val_metrics_detailed["per_class"][class_key]
+                    logger.info(
+                        f"{class_num:<10} "
+                        f"{metrics['precision']:<12.4f} "
+                        f"{metrics['recall']:<12.4f} "
+                        f"{metrics['f1']:<12.4f} "
+                        f"{metrics['support']:<10}"
+                    )
+            
+            # Print summary metrics
+            logger.info("-" * 80)
+            logger.info("SUMMARY METRICS:")
+            logger.info(f"  Accuracy:        {val_metrics_detailed['accuracy']:.4f}")
+            logger.info(f"  Balanced Acc:    {val_metrics_detailed['balanced_accuracy']:.4f}")
+            logger.info(f"  Macro F1:        {val_metrics_detailed['macro_f1']:.4f}")
+            logger.info(f"  Weighted F1:     {val_metrics_detailed['weighted_f1']:.4f}")
+            if 'auc' in val_metrics_detailed:
+                logger.info(f"  AUC:             {val_metrics_detailed['auc']:.4f}")
+            logger.info(f"  QWK:             {val_metrics_detailed['qwk']:.4f}")
+            logger.info("-" * 80)
+            logger.info("")
+        
+        # Record history
+        history_row = {
+            "epoch": epoch,
+            "stage": stage,
+            "lr": current_lr,
+            "train_loss": train_loss,
+            "train_ce_loss": train_loss_components['ce_loss'],
+            "train_loss_k": train_loss_components['loss_k'],
+            "train_acc": train_metrics["accuracy"],
+            "val_loss": val_loss,
+            "val_ce_loss": val_loss_components['ce_loss'],
+            "val_loss_k": val_loss_components['loss_k'],
+            "val_acc": val_metrics["accuracy"],
+            "val_balanced_acc": val_metrics.get("balanced_accuracy", None),
+            "val_macro_f1": val_metrics["macro_f1"],
+            "val_weighted_f1": val_metrics.get("weighted_f1", None),
+            "val_qwk": val_metrics["qwk"],
+            "mean_p_sum": train_loss_components['mean_p_sum'],
+            "time_sec": epoch_time
+        }
+        train_history.append(history_row)
+        
+        # Save CSV log
+        history_df = pd.DataFrame(train_history)
+        history_df.to_csv(outdir / "logs" / "metrics.csv", index=False)
+        
+        # Save plots after each epoch
+        if len(history_df) > 0:
+            plot_loss_curve(history_df, outdir / "plots" / "loss_curve.png")
+            plot_loss_components(history_df, outdir / "plots" / "loss_components.png")
+            plot_metrics_curve(history_df, outdir / "plots" / "metrics_curve.png")
+            plot_gate_stats(history_df, outdir / "plots" / "gate_stats.png", target_k=args.k)
+        
+        # Save checkpoints
+        checkpoint = {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "val_f1": val_metrics["macro_f1"],
+            "val_acc": val_metrics["accuracy"],
+            "args": vars(args)
+        }
+        torch.save(checkpoint, outdir / "checkpoints" / "last.pth")
+        
+        if is_best:
             patience_counter = 0
-            # Save best model
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "val_f1": best_val_f1,
-                "args": vars(args)
-            }, outdir / "best_model.pt")
-            logger.info(f"  → New best val F1: {best_val_f1:.4f}, saved model")
+            torch.save(checkpoint, outdir / "checkpoints" / "best.pth")
+            logger.info(f"  → Best checkpoint saved (Val F1: {best_val_f1:.4f})")
         else:
             patience_counter += 1
             if patience_counter >= args.early_stopping_patience:
@@ -334,12 +556,20 @@ def main():
             logger.info("SWITCHING FROM WARMUP TO HARD TOP-K")
             logger.info("=" * 80)
     
-    # Save training history
-    pd.DataFrame(train_history).to_csv(outdir / "training_history.csv", index=False)
+    # Save final confusion matrix for best epoch
+    if best_confusion_matrix_data is not None:
+        y_true_best, y_pred_best = best_confusion_matrix_data
+        plot_confusion_matrix(y_true_best, y_pred_best, 
+                            outdir / "plots" / "confusion_matrix_best.png", 
+                            normalize=False)
+        plot_confusion_matrix(y_true_best, y_pred_best, 
+                            outdir / "plots" / "confusion_matrix_best_normalized.png", 
+                            normalize=True)
+        logger.info(f"Saved confusion matrices for best epoch {best_epoch}")
     
     # Load best model for inference
     logger.info("Loading best model for inference...")
-    checkpoint = torch.load(outdir / "best_model.pt")
+    checkpoint = torch.load(outdir / "checkpoints" / "best.pth")
     model.load_state_dict(checkpoint["model_state_dict"])
     
     # Inference on train and test
