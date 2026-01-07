@@ -21,6 +21,7 @@ python train_selector_klgrade.py `
     --batch-size 8 `
     --lr 1e-4 `
     --use-class-weights
+    --variance-threshold 1e-6
 
 python train_selector_klgrade.py \
     --images-tr "/home/yaxi/nnUNet/nnUNet_raw/Dataset360_oaizib/imagesTr" \
@@ -28,16 +29,18 @@ python train_selector_klgrade.py \
     --radiomics-train-csv "/home/yaxi/OA_KLG_TopK/output_train/radiomics_results.csv" \
     --radiomics-test-csv "/home/yaxi/OA_KLG_TopK/output_test/radiomics_results.csv" \
     --klgrade-train-csv "/home/yaxi/OA_KLG_TopK/subInfo_train.xlsx" \
-    --outdir "training_logs_k30" \
-    --k 30 \
+    --outdir "training_logs_k50" \
+    --k 50 \
     --warmup-epochs 100 \
     --epochs 500 \
-    --early-stopping-patience 100 \
+    --early-stopping-patience 300 \
     --batch-size 8 \
     --lr 1e-4 \
     --use-class-weights \
-    --lambda-diversity 0.2 \
-    --device cuda:1
+    --lambda-diversity 0.3 \
+    --device cuda:0 \
+    --variance-threshold 1e-5
+
 """
 
 import json
@@ -257,6 +260,8 @@ def main():
                         help="Method for computing class weights (balanced: inverse frequency)")
     parser.add_argument("--lambda-diversity", type=float, default=0.1,
                         help="Weight for diversity loss (encourages different feature selections)")
+    parser.add_argument("--variance-threshold", type=float, default=1e-6,
+                        help="Variance threshold for feature filtering (features with variance < threshold will be removed)")
     
     args = parser.parse_args()
     
@@ -302,20 +307,85 @@ def main():
         expected_features=feature_names
     )
     
-    # Save feature mapping
-    feature_mapping = {}
+    # Load labels (needed to filter to cases with labels)
+    labels_train = load_klgrade_labels(Path(args.klgrade_train_csv))
+    
+    # Get common case IDs (cases with both radiomics and labels)
+    train_case_ids_with_labels = list(set(radiomics_train.keys()) & set(labels_train.keys()))
+    logger.info(f"Cases with both radiomics and labels: {len(train_case_ids_with_labels)}")
+    
+    # Variance-based feature filtering
+    logger.info("=" * 80)
+    logger.info("Variance-based Feature Filtering")
+    logger.info("=" * 80)
+    
+    # Calculate variance for each feature across training samples (only cases with labels)
+    train_radiomics_array = np.array([radiomics_train[cid] for cid in train_case_ids_with_labels])
+    feature_variances = np.var(train_radiomics_array, axis=0)
+    
+    # Log variance statistics
+    logger.info(f"Total features before filtering: {len(feature_variances)}")
+    logger.info(f"Variance statistics:")
+    logger.info(f"  Min:    {np.min(feature_variances):.6e}")
+    logger.info(f"  Max:    {np.max(feature_variances):.6e}")
+    logger.info(f"  Mean:   {np.mean(feature_variances):.6e}")
+    logger.info(f"  Median: {np.median(feature_variances):.6e}")
+    logger.info(f"  Std:    {np.std(feature_variances):.6e}")
+    
+    # Filter features based on variance threshold
+    valid_feature_indices = np.where(feature_variances >= args.variance_threshold)[0]
+    removed_feature_indices = np.where(feature_variances < args.variance_threshold)[0]
+    
+    logger.info(f"Variance threshold: {args.variance_threshold:.6e}")
+    logger.info(f"Features kept: {len(valid_feature_indices)}")
+    logger.info(f"Features removed: {len(removed_feature_indices)} ({100*len(removed_feature_indices)/len(feature_variances):.2f}%)")
+    
+    # Build feature mapping for removed features (for logging)
+    original_feature_mapping = {}
     for idx, (roi, feat) in enumerate([(r, f) for r in roi_names for f in feature_names]):
-        feature_mapping[idx] = f"{roi}:{feat}"
+        original_feature_mapping[idx] = f"{roi}:{feat}"
+    
+    if len(removed_feature_indices) > 0:
+        removed_features_info = []
+        for idx in removed_feature_indices:
+            removed_features_info.append({
+                "index": int(idx),
+                "name": original_feature_mapping[int(idx)],
+                "variance": float(feature_variances[idx])
+            })
+        
+        # Save removed features info
+        removed_features_path = outdir / "logs" / "removed_features_variance_filter.json"
+        with open(removed_features_path, "w") as f:
+            json.dump({
+                "variance_threshold": args.variance_threshold,
+                "total_features_before": len(feature_variances),
+                "features_kept": len(valid_feature_indices),
+                "features_removed": len(removed_feature_indices),
+                "removed_features": removed_features_info
+            }, f, indent=2)
+        logger.info(f"Saved removed features info to {removed_features_path}")
+    
+    # Filter radiomics data
+    logger.info("Filtering radiomics data...")
+    for cid in list(radiomics_train.keys()):
+        radiomics_train[cid] = radiomics_train[cid][valid_feature_indices]
+    for cid in list(radiomics_test.keys()):
+        radiomics_test[cid] = radiomics_test[cid][valid_feature_indices]
+    
+    logger.info("=" * 80)
+    
+    # Save feature mapping (only for kept features)
+    feature_mapping = {}
+    for new_idx, old_idx in enumerate(valid_feature_indices):
+        feature_mapping[new_idx] = original_feature_mapping[int(old_idx)]
     
     with open(outdir / "checkpoints" / "feature_names.json", "w") as f:
         json.dump(feature_mapping, f, indent=2)
     logger.info(f"Saved feature mapping to {outdir / 'checkpoints/feature_names.json'}")
     
-    # Load labels
-    labels_train = load_klgrade_labels(Path(args.klgrade_train_csv))
-    
-    # Get common case IDs
-    train_case_ids = list(set(radiomics_train.keys()) & set(labels_train.keys()))
+    # Get common case IDs (already computed above, but update variable name)
+    train_case_ids = train_case_ids_with_labels
     logger.info(f"Training cases with both radiomics and labels: {len(train_case_ids)}")
     
     # Stratified train/val split
