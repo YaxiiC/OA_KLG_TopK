@@ -21,6 +21,23 @@ python train_selector_klgrade.py `
     --batch-size 8 `
     --lr 1e-4 `
     --use-class-weights
+
+python train_selector_klgrade.py \
+    --images-tr "/home/yaxi/nnUNet/nnUNet_raw/Dataset360_oaizib/imagesTr" \
+    --images-ts "/home/yaxi/nnUNet/nnUNet_raw/Dataset360_oaizib/imagesTs" \
+    --radiomics-train-csv "/home/yaxi/OA_KLG_TopK/output_train/radiomics_results.csv" \
+    --radiomics-test-csv "/home/yaxi/OA_KLG_TopK/output_test/radiomics_results.csv" \
+    --klgrade-train-csv "/home/yaxi/OA_KLG_TopK/subInfo_train.xlsx" \
+    --outdir "training_logs_k30" \
+    --k 30 \
+    --warmup-epochs 100 \
+    --epochs 500 \
+    --early-stopping-patience 100 \
+    --batch-size 8 \
+    --lr 1e-4 \
+    --use-class-weights \
+    --lambda-diversity 0.2 \
+    --device cuda:1
 """
 
 import json
@@ -238,6 +255,8 @@ def main():
     parser.add_argument("--class-weight-method", type=str, default="balanced",
                         choices=["balanced", "balanced_subsample"],
                         help="Method for computing class weights (balanced: inverse frequency)")
+    parser.add_argument("--lambda-diversity", type=float, default=0.1,
+                        help="Weight for diversity loss (encourages different feature selections)")
     
     args = parser.parse_args()
     
@@ -466,6 +485,7 @@ def main():
             args.lambda_k_start,
             args.warmup_thr_start,
             args.warmup_thr_end,
+            args.lambda_diversity,
             progress_bar=pbar
         )
         pbar.close()
@@ -546,6 +566,7 @@ def main():
             "train_loss": train_loss,
             "train_ce_loss": train_loss_components['ce_loss'],
             "train_loss_k": train_loss_components['loss_k'],
+            "train_loss_diversity": train_loss_components.get('loss_diversity', 0.0),
             "train_acc": train_metrics["accuracy"],
             "val_loss": val_loss,
             "val_ce_loss": val_loss_components['ce_loss'],
@@ -632,6 +653,7 @@ def main():
         all_selected_features = []
         
         with torch.no_grad():
+            all_gate_variance = []
             for batch in loader:
                 images = batch["image"].to(device)
                 radiomics = batch["radiomics"].to(device)
@@ -640,6 +662,10 @@ def main():
                 logits, p = model(images, radiomics, return_gates=True)
                 probas = F.softmax(logits, dim=1)
                 preds = logits.argmax(dim=1)
+                
+                # Diagnostic: check gate variance across batch
+                gate_variance = p.var(dim=0).mean().item()  # Average variance across features
+                all_gate_variance.append(gate_variance)
                 
                 # Get top-k features for each sample
                 _, topk_indices = torch.topk(p, args.k, dim=1)
@@ -679,6 +705,21 @@ def main():
         with open(outdir / f"selected_features_{split_name}.json", "w") as f:
             json.dump(all_selected_features, f, indent=2)
         logger.info(f"Saved selected features to {outdir / f'selected_features_{split_name}.json'}")
+        
+        # Diagnostic: check feature selection diversity
+        if len(all_selected_features) > 0:
+            # Count unique feature sets
+            feature_sets = [tuple(f["topk_indices"]) for f in all_selected_features]
+            unique_sets = len(set(feature_sets))
+            total_samples = len(feature_sets)
+            diversity_ratio = unique_sets / total_samples if total_samples > 0 else 0.0
+            avg_gate_variance = np.mean(all_gate_variance) if all_gate_variance else 0.0
+            
+            logger.info(f"Feature Selection Diversity ({split_name}):")
+            logger.info(f"  Unique feature sets: {unique_sets}/{total_samples} ({diversity_ratio:.2%})")
+            logger.info(f"  Average gate variance: {avg_gate_variance:.6f}")
+            if diversity_ratio < 0.1:
+                logger.warning(f"  WARNING: Low diversity! Most patients have the same feature set.")
     
     logger.info("=" * 80)
     logger.info("Training complete!")

@@ -99,6 +99,14 @@ class FeatureSelector(nn.Module):
             nn.Dropout(0.3),
             nn.Linear(256, n_features)
         )
+        
+        # Initialize gate head with small random weights to encourage diversity
+        # This prevents the model from collapsing to a fixed feature set
+        for m in self.gate_head.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.1)  # Smaller gain for more diversity
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
     
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         """

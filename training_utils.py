@@ -112,6 +112,7 @@ def train_epoch(
     lambda_k_start: float,
     warmup_thr_start: float,
     warmup_thr_end: float,
+    lambda_diversity: float = 0.1,
     progress_bar=None
 ) -> Tuple[float, Dict[str, float], Dict[str, float]]:
     """
@@ -127,6 +128,8 @@ def train_epoch(
     total_loss = 0.0
     total_ce_loss = 0.0
     total_loss_k = 0.0
+    total_loss_diversity = 0.0
+    total_loss_entropy = 0.0
     all_p_sums = []
     all_preds = []
     all_labels = []
@@ -167,11 +170,40 @@ def train_epoch(
         p = torch.sigmoid(model.selector.gate_head(model.selector.backbone(images)))
         loss_k = ((p.sum(dim=1) - model.k) ** 2).mean()
         
+        # Diversity loss: encourage different feature selections across batch
+        # Penalize high correlation between gate vectors of different samples
+        # Compute pairwise cosine similarity between gate vectors
+        p_normalized = F.normalize(p, p=2, dim=1)  # [B, n_features]
+        # Compute similarity matrix: [B, B]
+        similarity_matrix = torch.mm(p_normalized, p_normalized.t())
+        # Remove diagonal (self-similarity) and take upper triangle
+        mask = torch.triu(torch.ones_like(similarity_matrix), diagonal=1).bool()
+        pairwise_similarities = similarity_matrix[mask]  # [B*(B-1)/2]
+        # Penalize high similarity (encourage diversity)
+        loss_diversity = pairwise_similarities.mean()
+        
+        # Entropy regularization: encourage exploration (prevent gate collapse)
+        # Higher entropy = more uniform distribution = more exploration
+        # We want to maximize entropy, so we minimize negative entropy
+        # Entropy: -sum(p * log(p + eps) + (1-p) * log(1-p + eps))
+        eps = 1e-8
+        entropy = -(p * torch.log(p + eps) + (1 - p) * torch.log(1 - p + eps)).sum(dim=1).mean()
+        # Normalize by number of features to get per-feature entropy
+        n_features = p.shape[1]
+        max_entropy = n_features * np.log(2)  # Maximum entropy when p=0.5 for all features
+        normalized_entropy = entropy / max_entropy
+        # We want to encourage higher entropy, so we penalize low entropy
+        # But only during warmup to allow convergence later
+        if epoch < warmup_epochs:
+            loss_entropy = -normalized_entropy * 0.05  # Small weight, encourage exploration
+        else:
+            loss_entropy = torch.tensor(0.0, device=device)
+        
         # Track p.sum() for gate statistics
         all_p_sums.extend(p.sum(dim=1).detach().cpu().numpy())
         
         # Total loss
-        loss = loss_cls + current_lambda_k * loss_k
+        loss = loss_cls + current_lambda_k * loss_k + lambda_diversity * loss_diversity + loss_entropy
         
         # Backward
         loss.backward()
@@ -180,15 +212,21 @@ def train_epoch(
         total_loss += loss.item()
         total_ce_loss += loss_cls.item()
         total_loss_k += loss_k.item()
+        total_loss_diversity += loss_diversity.item()
+        total_loss_entropy += loss_entropy.item()
         
         # Update progress bar if provided
         if progress_bar is not None:
+            # Compute gate variance across batch as diagnostic
+            gate_variance = p.var(dim=0).mean().item()  # Average variance across features
             progress_bar.set_postfix({
                 'lr': f'{current_lr:.2e}',
                 'loss': f'{loss.item():.4f}',
                 'ce': f'{loss_cls.item():.4f}',
                 'k': f'{loss_k.item():.4f}',
+                'div': f'{loss_diversity.item():.4f}',
                 'p_sum': f'{p.sum(dim=1).mean().item():.2f}',
+                'p_var': f'{gate_variance:.4f}',
                 'stage': stage
             })
             progress_bar.update(1)
@@ -201,6 +239,8 @@ def train_epoch(
     avg_loss = total_loss / len(dataloader)
     avg_ce_loss = total_ce_loss / len(dataloader)
     avg_loss_k = total_loss_k / len(dataloader)
+    avg_loss_diversity = total_loss_diversity / len(dataloader)
+    avg_loss_entropy = total_loss_entropy / len(dataloader)
     mean_p_sum = np.mean(all_p_sums) if all_p_sums else 0.0
     
     # Note: train_epoch doesn't compute probabilities, so AUC won't be available
@@ -209,6 +249,8 @@ def train_epoch(
     loss_components = {
         'ce_loss': avg_ce_loss,
         'loss_k': avg_loss_k,
+        'loss_diversity': avg_loss_diversity,
+        'loss_entropy': avg_loss_entropy,
         'mean_p_sum': mean_p_sum
     }
     
